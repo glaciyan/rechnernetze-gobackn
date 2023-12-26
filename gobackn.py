@@ -32,22 +32,19 @@ class GoBackNSocket:
 
     def receive(self, packet) -> int:
         (packet_counter,) = unpack("!i", packet[:4])
-        content = packet[4:]
-        print('GBN receive:', 'counter:', packet_counter, 'content:', content)
-        self.concat_message += content
-
-        return packet_counter
-
-    def receive_ack(self, packet):
-        (packet_counter,) = unpack("!i", packet)
-        id = -packet_counter
-        print("got ack for", id)
-        if id == packet_counter:
+        if packet_counter < 0 and -packet_counter == self.expected_ack:
+            print("got a good ack", self.expected_ack)
             self.expected_ack += 1
-            self.sem.release()
+            # we have gotten a valid ack
+        else:
+            content = packet[4:]
+            print('GBN receive:', 'counter:', packet_counter, 'content:', content)
+            self.concat_message += content
+
+            return packet_counter
 
     def sending(self):
-        self.sem.acquire(True, self.timeout)
+        self.sem.acquire()
 
 
 class lossy_udp_socket():
@@ -68,32 +65,25 @@ class lossy_udp_socket():
         self.sock.bind(('', loc_port))
 
         # spawn server thread
-        # t = Thread(target=self.recv)
-        # t.start()
+        t = Thread(target=self.recv)
+        t.start()
 
     # interface for sending packets
     def send(self, p):
         chunk_size = self.nBytes - 4
         packet_counter = 0
 
-        def listen_to_ack():
-            while not self.STOP:
-                packet, addr = self.sock.recvfrom(4)
-                self.conn.receive_ack(packet)
-
         while True:
             packet = access_chunk(p, packet_counter, chunk_size)
             if len(packet) < 1:
                 break; # jump out if we have nothing left
 
-            self.conn.sem.acquire(True, 1.0)
+            self.conn.sending()
 
             print('Sending packet with length: ' + str(len(packet)))
 
             outbound = pack("!i", packet_counter) + packet
             self.sock.sendto(outbound, self.addr)
-
-            # TODO self.sock.recvfrom() get the ack from the server, which is -id
 
             # get the next packet
             packet_counter += 1
@@ -115,6 +105,7 @@ class lossy_udp_socket():
                     if random.random() > self.PLR:
                         print('Received packet with length: '+str(len(packet)))
                         id = self.conn.receive(packet)
+                        print("acking", id)
                         self.sock.sendto(pack("!i", -id), addr) # send ack
                     else:
                         print('Dropped packet with length: '+str(len(packet)))
