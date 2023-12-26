@@ -46,7 +46,7 @@ class GoBackNSocket:
         # self.sem_finalize.acquire()
 
         self.window_size = 4
-        self.timeout = 1.0
+        self.timeout = 0.1
         self.current_window = 0  # client
         self.waiting_for = 0  # client
         self.sending_sem = Semaphore(self.window_size)
@@ -63,14 +63,15 @@ class GoBackNSocket:
             return packet_id
         else:
             self.handle_timeout()
+            self.sending_sem._value = self.window_size
+            with self.sending_sem._cond:
+                self.sending_sem._cond.notify()
             self.sending_sem.acquire()
             return self.current_window
 
     def handle_timeout(self):
         my_print("[TIMEOUT] packet", self.current_window,
-                    "timed out starting over")
-        # maybe this can open too many slots in the semaphore
-        self.sending_sem.release(self.window_size)
+                 "timed out starting over")
         return self.current_window
 
     def finalize(self):
@@ -84,8 +85,8 @@ class GoBackNSocket:
     def receive(self, packet) -> (int, bool):
         (is_ack, id,) = unpack(HEADER_FORMAT, packet[:HEADER_SIZE])
 
-        my_print("[RECEIVE] Received packet with size",
-                 len(packet), "id", id, "ack", is_ack)
+        # my_print("[RECEIVE] Received packet with size",
+        #          len(packet), "id", id, "ack", is_ack)
 
         if is_ack:
             # Client
@@ -96,7 +97,8 @@ class GoBackNSocket:
                 with self.finalizer:
                     self.finalizer.notify()
             else:
-                my_print("ignoring ack", id)
+                pass
+                # my_print("ignoring ack", id)
             return (id, False)
         elif id == self.expected_packet_id:  # expected packet id
             # Server
@@ -107,7 +109,7 @@ class GoBackNSocket:
             self.last_ack = id
 
             my_print('[GBN] received:', 'id',
-                     id, 'content:', content, "packet id", self.expected_packet_id, "last_ack", self.last_ack)
+                     id, 'content:', content, "next i want", self.expected_packet_id, "last ack sent was", self.last_ack)
 
             return (id, True)  # send ack for the received packet
         elif id < self.expected_packet_id:
@@ -146,20 +148,20 @@ class lossy_udp_socket():
 
     # interface for sending packets
     def send(self, p):
+        offset = self.conn.current_window
         chunk_size = self.nBytes - HEADER_SIZE
         total_packets = math.ceil(len(p) / chunk_size)
-        current_packet = 0
-
+        current_packet = offset
 
         while True:
             current_packet = self.conn.acquire(current_packet)
 
-            packet = access_chunk(p, current_packet, chunk_size)
+            packet = access_chunk(p, current_packet - offset, chunk_size)
             if len(packet) == 0:
                 with self.conn.finalizer:
                     self.conn.finalizer.wait(self.conn.timeout)
                     # when a packet times out
-                    if self.conn.current_window < total_packets:
+                    if self.conn.current_window < total_packets + offset:
                         current_packet = self.conn.handle_timeout()
                         continue
                     else:
@@ -176,7 +178,7 @@ class lossy_udp_socket():
 
     # interface for ending socket
     def stop(self):
-        my_print("content received:", self.conn.final_message)
+        my_print("content received:", self.conn.final_message.decode())
         self.STOP = True
 
     # continuously listening for incoming packets
@@ -194,12 +196,12 @@ class lossy_udp_socket():
                         # my_print('Received packet with length: '+str(len(packet)), "id", id)
                         id, send_ack = self.conn.receive(packet)
                         if send_ack:
-                            my_print("[SERVER ACK] acking", id)
+                            # my_print("[SERVER ACK] acking", id)
                             self.sock.sendto(
                                 pack(HEADER_FORMAT, True, id), addr)  # send ack
                     else:
-                        my_print('[DROP] Dropped packet with length: ' +
-                                 str(len(packet)), "id", temp_id)
+                        my_print('[DROP] Dropped packet size',
+                                 len(packet), 'id', temp_id)
                 else:
                     my_print(
                         'Warning: received packet from remote address'+str(addr))
@@ -224,6 +226,9 @@ server = lossy_udp_socket(server_handler, SERVER_PORT,
                           client.sock.getsockname(), RELIABILITY)
 
 
+client.send(b'hello everyone\n')
+client.send(b'this is my message 1\n')
+client.send(b'this is my message 2\n')
 client.send(lorem.encode())
 client.stop()
 server.stop()
