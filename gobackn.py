@@ -218,12 +218,12 @@ RELIABILITY = 0.5
 
 client_handler = GoBackNSocket()
 client = lossy_udp_socket(client_handler, CLIENT_PORT,
-                          (IP, SERVER_PORT), RELIABILITY)
+                          (IP, SERVER_PORT), 1 - RELIABILITY)
 my_print("client has port", client.sock.getsockname())
 
 server_handler = GoBackNSocket()
 server = lossy_udp_socket(server_handler, SERVER_PORT,
-                          client.sock.getsockname(), RELIABILITY)
+                          client.sock.getsockname(), 1 - RELIABILITY)
 
 
 client.send(b'hello everyone\n')
