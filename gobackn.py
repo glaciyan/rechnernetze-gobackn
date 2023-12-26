@@ -1,6 +1,6 @@
 import math
 import socket
-from threading import Thread, Semaphore
+from threading import Thread, Semaphore, Condition, Lock
 import random
 from struct import pack, unpack
 
@@ -34,73 +34,97 @@ def access_chunk(data: bytes, index: int, chunk_size: int) -> bytes:
 
 
 class GoBackNSocket:
-    def __init__(self, window_size=4, timeout=1.0):
-        self.window_size = window_size
-        self.timeout = timeout
-        self.sem = Semaphore(self.window_size)
-        self.expected_ack = 0
+    def __init__(self):
+        # self.window_size = window_size
+        # self.timeout = timeout
+        # self.sem = Semaphore(self.window_size)
+        # self.expected_ack = 0
+        # self.last_ack = None
+        # self.concat_message = b''
+        # self.total_packets = 0
+        # self.sem_finalize = Semaphore()
+        # self.sem_finalize.acquire()
+
+        self.window_size = 4
+        self.timeout = 1.0
+        self.current_window = 0  # client
+        self.waiting_for = 0  # client
+        self.sending_sem = Semaphore(self.window_size)
+        self.finalizer = Condition()
+        self.successful_finalize = False
+        self.expected_packet_id = 0  # server
         self.last_ack = None
-        self.concat_message = b''
-        self.total_packets = 0
-        self.sem_finalize = Semaphore()
-        self.sem_finalize.acquire()
+        self.final_message = b''
+
+    # When a timeout occurs, return the current_window
+    def acquire(self, packet_id):
+        success = self.sending_sem.acquire(True, self.timeout)
+        if success:
+            return packet_id
+        else:
+            self.handle_timeout()
+            self.sending_sem.acquire()
+            return self.current_window
+
+    def handle_timeout(self):
+        my_print("[TIMEOUT] packet", self.current_window,
+                    "timed out starting over")
+        # maybe this can open too many slots in the semaphore
+        self.sending_sem.release(self.window_size)
+        return self.current_window
+
+    def finalize(self):
+        self.successful_finalize = True
+        self.finalizer.notify()
+
+    def wait_for_finalize(self):
+        self.finalizer.wait(self.timeout)
+        return self.successful_finalize
 
     def receive(self, packet) -> (int, bool):
         (is_ack, id,) = unpack(HEADER_FORMAT, packet[:HEADER_SIZE])
-        # my_print("[RECEIVE] Received packet with size", len(packet), "id", packet_counter, "ack", is_ack)
+
+        my_print("[RECEIVE] Received packet with size",
+                 len(packet), "id", id, "ack", is_ack)
+
         if is_ack:
             # Client
-            if id == self.expected_ack:  # will ignore what we dont want
+            if id == self.current_window:  # will ignore what we dont want
                 my_print("[CLIENT ACK] ack recieved", id)
-                self.expected_ack += 1
-                if self.expected_ack == self.total_packets:
-                    self.sem_finalize.release()
-                self.sem.release()
+                self.current_window += 1
+                self.sending_sem.release()  # allow for one more packet to be sent
+                with self.finalizer:
+                    self.finalizer.notify()
             else:
                 my_print("ignoring ack", id)
             return (id, False)
-        elif id == self.expected_ack:  # expected packet id
+        elif id == self.expected_packet_id:  # expected packet id
             # Server
             content = packet[HEADER_SIZE:]
-            self.concat_message += content
+            self.final_message += content
 
-            self.expected_ack += 1
+            self.expected_packet_id += 1
             self.last_ack = id
 
             my_print('[GBN] received:', 'id',
-                     id, 'content:', content, "expected_ack", self.expected_ack, "last_ack", self.last_ack)
+                     id, 'content:', content, "packet id", self.expected_packet_id, "last_ack", self.last_ack)
 
-            return (id, True)  # send ack for this id
-        elif id < self.expected_ack:
-            return (id, True)  # reack already received packet
+            return (id, True)  # send ack for the received packet
+        elif id < self.expected_packet_id:
+            return (id, True)  # re-ack already received packet
         else:
             # Server
             # the ack was in wrong order, we missed something
             my_print("[ORDER] received a data packet in the wrong order id",
-                     id, "expected", self.expected_ack, "resending", self.last_ack)
+                     id, "expected", self.expected_packet_id, "resending", self.last_ack)
             if self.last_ack is None:
                 return (0, False)
             else:
                 return (self.last_ack, True)  # send last ack again
 
-    def acquire(self) -> bool:
-        if not self.sem.acquire(True, self.timeout):
-            my_print("[TIMEOUT] packet", self.expected_ack,
-                     "timed out starting over")
-            self.clear()
-            return True
-        else:
-            return False
-
-    def release(self):
-        self.sem.release()
-
-    def clear(self):
-        self.sem.release(4)
-
 
 class lossy_udp_socket():
-    nBytes = 150
+    nBytes = 140
 
     def __init__(self, conn: GoBackNSocket, loc_port, rem_addr, PLR):
         # conn: handler to be called for received packets with function "receive(packet)"
@@ -122,38 +146,37 @@ class lossy_udp_socket():
 
     # interface for sending packets
     def send(self, p):
-
         chunk_size = self.nBytes - HEADER_SIZE
-        packet_counter = 0
         total_packets = math.ceil(len(p) / chunk_size)
-        self.conn.total_packets = total_packets
+        current_packet = 0
+
 
         while True:
-            packet = access_chunk(p, packet_counter, chunk_size)
+            current_packet = self.conn.acquire(current_packet)
+
+            packet = access_chunk(p, current_packet, chunk_size)
             if len(packet) == 0:
-                self.conn.acquire()
+                with self.conn.finalizer:
+                    self.conn.finalizer.wait(self.conn.timeout)
+                    # when a packet times out
+                    if self.conn.current_window < total_packets:
+                        current_packet = self.conn.handle_timeout()
+                        continue
+                    else:
+                        break
 
-            timeout = self.conn.acquire()
-            if timeout:
-                packet_counter = self.conn.expected_ack  # go back to what we expected
-                continue
-
-            outbound = pack(HEADER_FORMAT, False, packet_counter) + packet
+            outbound = pack(HEADER_FORMAT, False, current_packet) + packet
             my_print('[SEND] Sending packet with length: ' +
-                     str(len(outbound)), "id", packet_counter)
+                     str(len(outbound)), "id", current_packet)
             # 1. client sends data in split chunks
             self.sock.sendto(outbound, self.addr)
 
             # get the next packet
-            packet_counter += 1
-
-        self.conn.sem_finalize.acquire()
-        my_print("TOTAL", total_packets, self.conn.expected_ack)
+            current_packet += 1
 
     # interface for ending socket
     def stop(self):
-        my_print("Closing... final message recieved\n",
-                 self.conn.concat_message.decode())
+        my_print("content received:", self.conn.final_message)
         self.STOP = True
 
     # continuously listening for incoming packets
@@ -189,7 +212,7 @@ SERVER_PORT = 4187
 IP = '127.0.0.1'
 CLIENT_PORT = 0  # get any avaiable port
 
-RELIABILITY = 0.1
+RELIABILITY = 0.5
 
 client_handler = GoBackNSocket()
 client = lossy_udp_socket(client_handler, CLIENT_PORT,
